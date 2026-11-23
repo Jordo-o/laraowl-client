@@ -5,37 +5,50 @@ namespace Laraowl\Client;
 use Illuminate\View\Compilers\BladeCompiler;
 use Throwable;
 
-/**
- * Resolve compiled Blade stack frames back to their original view.
- *
- * Line numbers are only returned when an exact, unambiguous compiled-line
- * match can be established. An incorrect Blade line is worse than no line.
- *
- * @internal
- */
+use function array_key_exists;
+use function file_get_contents;
+use function is_file;
+use function preg_match;
+use function realpath;
+use function str_ends_with;
+use function str_replace;
+use function substr;
+
+/** @internal */
 final class BladeTraceMapper
 {
-    /** @var array<string, array{file: string, lines: array<int, int> }|null> */
+    /** @var array<string, array{file: string, lines: array<int, int>}|null> */
     private array $cache = [];
+
+    private bool $building = false;
+
+    private BladeSourceMapCompiler $sourceMapCompiler;
 
     public function __construct(private BladeCompiler $compiler)
     {
+        $this->sourceMapCompiler = new BladeSourceMapCompiler($compiler);
+    }
+
+    public function reset(): void
+    {
+        $this->cache = [];
     }
 
     /** @return array{string, int|null}|null */
     public function map(string $file, ?int $line): ?array
     {
-        if (! str_ends_with($file, '.php') || ! is_file($file)) {
-            return null;
-        }
-
-        $compiledPath = str_replace('\\', '/', $file);
-        if (! str_contains($compiledPath, '/storage/framework/views/')) {
+        // The default Blade compiler uses a hash, even with a custom cache path.
+        if ($this->building || ! preg_match('~(?:^|[/\\\\])[0-9a-f]+\.[^/\\\\]+$~iD', $file)) {
             return null;
         }
 
         if (! array_key_exists($file, $this->cache)) {
-            $this->cache[$file] = $this->buildMap($file);
+            $this->building = true;
+            try {
+                $this->cache[$file] = $this->buildMap($file);
+            } finally {
+                $this->building = false;
+            }
         }
 
         $map = $this->cache[$file];
@@ -51,59 +64,36 @@ final class BladeTraceMapper
     private function buildMap(string $compiledFile): ?array
     {
         try {
-            $compiled = file_get_contents($compiledFile);
-            if ($compiled === false || ! preg_match('~/\*\*PATH (.*?) ENDPATH\*\*/~s', $compiled, $matches)) {
+            $compiled = $this->readFile($compiledFile);
+            if ($compiled === false || ! preg_match('~<\?php /\*\*PATH ([^\r\n]+) ENDPATH\*\*/ \?>\s*\z~', $compiled, $matches, PREG_OFFSET_CAPTURE)) {
                 return null;
             }
 
-            $sourceFile = $matches[1];
-            if (! is_file($sourceFile) || ! str_ends_with($sourceFile, '.blade.php')) {
+            $sourceFile = $matches[1][0];
+            $compiledPath = realpath($compiledFile);
+            if ($compiledPath === false || realpath($this->compiler->getCompiledPath($sourceFile)) !== $compiledPath
+                || ! str_ends_with($sourceFile, '.blade.php') || ! is_file($sourceFile)) {
                 return null;
             }
 
-            $source = file_get_contents($sourceFile);
-            if ($source === false) {
-                return null;
-            }
-
-            $compiledLines = preg_split('/\r\n|\n|\r/', $compiled);
-            $sourceLines = preg_split('/\r\n|\n|\r/', $source);
-            if ($compiledLines === false || $sourceLines === false) {
-                return null;
-            }
-
-            // A unique, identical generated line is a safe source anchor.
-            // This handles plain Blade markup and single-line expressions.
-            $candidates = [];
-            foreach ($sourceLines as $index => $sourceLine) {
-                if (trim($sourceLine) === '') {
-                    continue;
-                }
-
-                $generated = $this->compiler->compileString($sourceLine);
-                if (str_contains($generated, "\n") || trim($generated) === '') {
-                    continue;
-                }
-
-                $candidates[$generated][] = $index + 1;
-            }
-
-            $compiledOccurrences = array_count_values($compiledLines);
             $lines = [];
-            foreach ($compiledLines as $index => $compiledLine) {
-                if (($compiledOccurrences[$compiledLine] ?? 0) !== 1) {
-                    continue;
-                }
-
-                $sourceMatches = $candidates[$compiledLine] ?? [];
-                if (count($sourceMatches) === 1) {
-                    $lines[$index + 1] = $sourceMatches[0];
+            $source = $this->readFile($sourceFile);
+            if ($source !== false) {
+                try {
+                    $lines = $this->sourceMapCompiler->compile($sourceFile, $source, substr($compiled, 0, $matches[0][1]));
+                } catch (Throwable) {
+                    // An exception in a Blade extension must not interrupt reporting.
                 }
             }
 
-            return ['file' => $sourceFile, 'lines' => $lines];
+            return ['file' => str_replace('/', DIRECTORY_SEPARATOR, $sourceFile), 'lines' => $lines];
         } catch (Throwable) {
             return null;
         }
+    }
+
+    private function readFile(string $file): string|false
+    {
+        return is_file($file) ? @file_get_contents($file) : false;
     }
 }

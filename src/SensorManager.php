@@ -9,7 +9,6 @@ use Illuminate\Console\Events\ScheduledTaskSkipped;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Http\Request;
-use Illuminate\View\Compilers\BladeCompiler;
 use Illuminate\Mail\Events\MessageSending;
 use Illuminate\Mail\Events\MessageSent;
 use Illuminate\Notifications\Events\NotificationSending;
@@ -19,6 +18,7 @@ use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobQueued;
 use Illuminate\Queue\Events\JobQueueing;
 use Illuminate\Queue\Events\JobReleasedAfterException;
+use Illuminate\View\Compilers\BladeCompiler;
 use Laraowl\Client\Records\CacheEvent as CacheEventRecord;
 use Laraowl\Client\Records\Command;
 use Laraowl\Client\Records\Exception;
@@ -52,6 +52,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\HttpFoundation\Response;
 use Throwable;
 
+use function app;
 use function hash;
 
 /**
@@ -254,15 +255,27 @@ final class SensorManager
      */
     public function exception(Throwable $e, ?bool $handled): array
     {
-        $sensor = $this->exceptionSensor ??= new ExceptionSensor(
+        $sensor = $this->exceptionSensor ??= $this->makeExceptionSensor();
+
+        return $sensor($e, $handled);
+    }
+
+    private function makeExceptionSensor(): ExceptionSensor
+    {
+        // Resolve the named binding used by the view engine and its extensions.
+        try {
+            $compiler = app()->bound('blade.compiler') ? app('blade.compiler') : null;
+        } catch (Throwable) {
+            $compiler = null;
+        }
+
+        return new ExceptionSensor(
             executionState: $this->executionState,
             clock: $this->clock,
             location: $this->location,
             captureSourceCode: $this->captureExceptionSourceCode,
-            bladeTraceMapper: app()->bound('blade.compiler') ? new BladeTraceMapper(app(BladeCompiler::class)) : null,
+            bladeTraceMapper: $compiler instanceof BladeCompiler ? new BladeTraceMapper($compiler) : null,
         );
-
-        return $sensor($e, $handled);
     }
 
     /**
