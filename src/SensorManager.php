@@ -9,6 +9,7 @@ use Illuminate\Console\Events\ScheduledTaskSkipped;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Http\Request;
+use Illuminate\View\Compilers\BladeCompiler;
 use Illuminate\Mail\Events\MessageSending;
 use Illuminate\Mail\Events\MessageSent;
 use Illuminate\Notifications\Events\NotificationSending;
@@ -258,6 +259,7 @@ final class SensorManager
             clock: $this->clock,
             location: $this->location,
             captureSourceCode: $this->captureExceptionSourceCode,
+            bladeTraceMapper: app()->bound('blade.compiler') ? new BladeTraceMapper(app(BladeCompiler::class)) : null,
         );
 
         return $sensor($e, $handled);
