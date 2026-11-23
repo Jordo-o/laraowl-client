@@ -4,6 +4,7 @@ namespace Laraowl\Client\Sensors;
 
 use Illuminate\Foundation\Bootstrap\HandleExceptions;
 use Illuminate\View\ViewException;
+use Laraowl\Client\BladeTraceMapper;
 use Laraowl\Client\Clock;
 use Laraowl\Client\Facades\LaraowlClient;
 use Laraowl\Client\Location;
@@ -48,6 +49,7 @@ final class ExceptionSensor
         private Clock $clock,
         private Location $location,
         private bool $captureSourceCode,
+        private ?BladeTraceMapper $bladeTraceMapper = null,
     ) {
         //
     }
@@ -58,15 +60,14 @@ final class ExceptionSensor
     public function __invoke(Throwable $e, ?bool $handled): array
     {
         $nowMicrotime = $this->clock->microtime();
-        [$file, $line] = $this->location->forException($e);
-        $normalizedException = match ($e->getPrevious()) {
-            null => $e,
-            default => match (true) {
-                $e instanceof ViewException,
-                $e instanceof IgnitionViewException => $e->getPrevious(),
-                default => $e,
-            },
-        };
+        $this->bladeTraceMapper?->reset();
+        $normalizedException = $e;
+        while (($previous = $normalizedException->getPrevious()) !== null
+            && ($normalizedException instanceof ViewException || $normalizedException instanceof IgnitionViewException)) {
+            $normalizedException = $previous;
+        }
+
+        [$file, $line] = $this->exceptionLocation($e, $normalizedException);
 
         $handled ??= $this->wasManuallyReported($normalizedException);
 
@@ -113,6 +114,28 @@ final class ExceptionSensor
         ];
     }
 
+    /** @return array{string, int|null} */
+    private function exceptionLocation(Throwable $exception, Throwable $cause): array
+    {
+        $mapped = $this->bladeTraceMapper?->map($cause->getFile(), $cause->getLine());
+
+        // When view code calls into PHP, the original exception location may be
+        // outside Blade. For a view wrapper, look for its innermost view frame.
+        if ($mapped === null && $cause !== $exception) {
+            foreach ($cause->getTrace() as $frame) {
+                if (isset($frame['file']) && ($mapped = $this->bladeTraceMapper?->map($frame['file'], $frame['line'] ?? null)) !== null) {
+                    break;
+                }
+            }
+        }
+
+        if ($mapped === null) {
+            return $this->location->forException($exception);
+        }
+
+        return [$this->location->normalizeFile($mapped[0]), $mapped[1]];
+    }
+
     private function wasManuallyReported(Throwable $e): bool
     {
         foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, limit: 20) as $frame) {
@@ -129,13 +152,14 @@ final class ExceptionSensor
      */
     private function serializeTrace(Throwable $e): string
     {
+        [$file, $line] = $this->mapBladeLocation($e->getFile(), $e->getLine());
         $trace = [
             // Insert the exception location as the first frame.
             // This matches the behavior of Symfony's exception renderer.
             [
-                'file' => $this->location->normalizeFile($e->getFile()).':'.$e->getLine(),
+                'file' => $this->formatLocation($file, $line),
                 'source' => '',
-                'code' => $this->fetchSourceCode($e->getFile(), $e->getLine()),
+                'code' => $this->fetchSourceCode($file, $line),
             ],
         ];
 
@@ -146,14 +170,10 @@ final class ExceptionSensor
                 continue;
             }
 
-            $file = match (true) {
-                ! isset($frame['file']) => '[internal function]',
-                ! is_string($frame['file']) => '[unknown file]', // @phpstan-ignore booleanNot.alwaysFalse
-                default => $this->location->normalizeFile($frame['file']),
-            };
-
-            if (isset($frame['line']) && is_int($frame['line'])) { // @phpstan-ignore booleanAnd.rightAlwaysTrue
-                $file .= ':'.$frame['line'];
+            $file = $frame['file'] ?? null;
+            $line = $frame['line'] ?? null;
+            if ($file !== null) {
+                [$file, $line] = $this->mapBladeLocation($file, $line);
             }
 
             $source = '';
@@ -196,9 +216,9 @@ final class ExceptionSensor
             $source .= ')';
 
             $trace[] = [
-                'file' => $file,
+                'file' => $this->formatLocation($file ?? '[internal function]', $line),
                 'source' => $source,
-                'code' => $this->fetchSourceCode($frame['file'] ?? null, $frame['line'] ?? null),
+                'code' => $this->fetchSourceCode($file, $line),
             ];
         }
 
@@ -206,6 +226,17 @@ final class ExceptionSensor
         $this->capturedCodeFrames = 0;
 
         return json_encode($trace, flags: JSON_THROW_ON_ERROR);
+    }
+
+    /** @return array{string, int|null} */
+    private function mapBladeLocation(string $file, ?int $line): array
+    {
+        return $this->bladeTraceMapper?->map($file, $line) ?? [$file, $line];
+    }
+
+    private function formatLocation(string $file, ?int $line): string
+    {
+        return $this->location->normalizeFile($file).($line !== null ? ':'.$line : '');
     }
 
     private function fetchSourceCode(mixed $file, mixed $line, int $context = 5): ?stdClass
