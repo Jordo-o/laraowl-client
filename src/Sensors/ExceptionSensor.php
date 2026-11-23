@@ -5,6 +5,7 @@ namespace Laraowl\Client\Sensors;
 use Illuminate\Foundation\Bootstrap\HandleExceptions;
 use Illuminate\View\ViewException;
 use Laraowl\Client\Clock;
+use Laraowl\Client\BladeTraceMapper;
 use Laraowl\Client\Facades\LaraowlClient;
 use Laraowl\Client\Location;
 use Laraowl\Client\Records\Exception;
@@ -48,6 +49,7 @@ final class ExceptionSensor
         private Clock $clock,
         private Location $location,
         private bool $captureSourceCode,
+        private ?BladeTraceMapper $bladeTraceMapper = null,
     ) {
         //
     }
@@ -59,6 +61,7 @@ final class ExceptionSensor
     {
         $nowMicrotime = $this->clock->microtime();
         [$file, $line] = $this->location->forException($e);
+        [$file, $line] = $this->mapBladeLocation($file, $line);
         $normalizedException = match ($e->getPrevious()) {
             null => $e,
             default => match (true) {
@@ -133,9 +136,9 @@ final class ExceptionSensor
             // Insert the exception location as the first frame.
             // This matches the behavior of Symfony's exception renderer.
             [
-                'file' => $this->location->normalizeFile($e->getFile()).':'.$e->getLine(),
+                'file' => $this->formatLocation($e->getFile(), $e->getLine()),
                 'source' => '',
-                'code' => $this->fetchSourceCode($e->getFile(), $e->getLine()),
+                'code' => $this->fetchMappedSourceCode($e->getFile(), $e->getLine()),
             ],
         ];
 
@@ -152,7 +155,9 @@ final class ExceptionSensor
                 default => $this->location->normalizeFile($frame['file']),
             };
 
-            if (isset($frame['line']) && is_int($frame['line'])) { // @phpstan-ignore booleanAnd.rightAlwaysTrue
+            if (isset($frame['file']) && is_string($frame['file'])) {
+                $file = $this->formatLocation($frame['file'], isset($frame['line']) && is_int($frame['line']) ? $frame['line'] : null);
+            } elseif (isset($frame['line']) && is_int($frame['line'])) {
                 $file .= ':'.$frame['line'];
             }
 
@@ -198,7 +203,7 @@ final class ExceptionSensor
             $trace[] = [
                 'file' => $file,
                 'source' => $source,
-                'code' => $this->fetchSourceCode($frame['file'] ?? null, $frame['line'] ?? null),
+                'code' => $this->fetchMappedSourceCode($frame['file'] ?? null, $frame['line'] ?? null),
             ];
         }
 
@@ -206,6 +211,34 @@ final class ExceptionSensor
         $this->capturedCodeFrames = 0;
 
         return json_encode($trace, flags: JSON_THROW_ON_ERROR);
+    }
+
+    /** @return array{string, int|null} */
+    private function mapBladeLocation(string $file, ?int $line): array
+    {
+        if ($this->bladeTraceMapper === null) {
+            return [$file, $line];
+        }
+
+        $mapped = $this->bladeTraceMapper->map($file, $line);
+
+        return $mapped ?? [$file, $line];
+    }
+
+    private function formatLocation(string $file, ?int $line): string
+    {
+        [$file, $line] = $this->mapBladeLocation($file, $line);
+
+        return $this->location->normalizeFile($file).($line !== null ? ':'.$line : '');
+    }
+
+    private function fetchMappedSourceCode(mixed $file, mixed $line): ?stdClass
+    {
+        if (is_string($file)) {
+            [$file, $line] = $this->mapBladeLocation($file, is_int($line) ? $line : null);
+        }
+
+        return $this->fetchSourceCode($file, $line);
     }
 
     private function fetchSourceCode(mixed $file, mixed $line, int $context = 5): ?stdClass
